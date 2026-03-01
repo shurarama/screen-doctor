@@ -54,7 +54,7 @@ static int is_root_window(xcb_connection_t *c, xcb_drawable_t drawable) {
 static int take_screenshot(const char *output_path) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "spectacle --background --nonotify --fullscreen --output '%s' 2>/dev/null",
+             "env -u QT_QPA_PLATFORM spectacle --background --nonotify --fullscreen --output '%s' 2>/dev/null",
              output_path);
     int ret = system(cmd);
     if (ret != 0) return -1;

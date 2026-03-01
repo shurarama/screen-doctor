@@ -1,0 +1,4 @@
+*.so
+*.o
+test_grab
+test_xcb_grab

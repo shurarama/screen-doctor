@@ -1,6 +1,7 @@
 CC = gcc
 CFLAGS = -shared -fPIC -Wall -O2
-LIBS = $(shell pkg-config --cflags --libs xcb xcb-randr libpng) -ldl
+XI_LIBS := $(shell pkg-config --exists xi 2>/dev/null && pkg-config --cflags --libs xi)
+LIBS = $(shell pkg-config --cflags --libs xcb xcb-randr x11 libpng) $(XI_LIBS) -ldl -pthread
 
 all: grab_override.so
 

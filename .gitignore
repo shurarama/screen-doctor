@@ -2,3 +2,5 @@
 *.o
 test_grab
 test_xcb_grab
+screen-doctor-active-window-helper
+screen-doctor-activity-helper

@@ -1,0 +1,17 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "screen-doctor"
+            }
+        ],
+        "Description": "Publishes KWin active-window metadata for screen-doctor",
+        "Icon": "preferences-system-windows-script-test",
+        "Id": "screen-doctor-active-window",
+        "License": "MIT",
+        "Name": "Screen Doctor Active Window"
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

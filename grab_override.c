@@ -21,7 +21,11 @@
 #include <pthread.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <sys/epoll.h>
+#include <sys/wait.h>
+
+extern char **environ;
 
 #ifndef __has_include
 #define __has_include(x) 0
@@ -3030,19 +3034,76 @@ static int is_root_window(xcb_connection_t *c, xcb_drawable_t drawable) {
 }
 
 static int take_screenshot(const char *output_path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-             "env -u QT_QPA_PLATFORM -u LD_PRELOAD "
-             "-u GRAB_OVERRIDE_SCREENSHOT -u GRAB_OVERRIDE_ACTIVE_WINDOW "
-             "-u GRAB_OVERRIDE_ACTIVE_WINDOW_TTL_MS -u GRAB_OVERRIDE_ACTIVE_WINDOW_DIAG "
-             "-u GRAB_OVERRIDE_ACTIVITY -u GRAB_OVERRIDE_ACTIVITY_TTL_MS "
-             "-u GRAB_OVERRIDE_ACTIVITY_RATE_MS "
-             "-u GRAB_OVERRIDE_DIAG "
-             "-u GRAB_OVERRIDE_DIAG_XCB -u GRAB_OVERRIDE_DIAG_XINPUT "
-             "spectacle --background --nonotify --fullscreen --output '%s' 2>/dev/null",
-             output_path);
-    int ret = system(cmd);
-    if (ret != 0) return -1;
+    static const char *const unset_names[] = {
+        "QT_QPA_PLATFORM",
+        "LD_PRELOAD",
+        "GRAB_OVERRIDE_SCREENSHOT",
+        "GRAB_OVERRIDE_ACTIVE_WINDOW",
+        "GRAB_OVERRIDE_ACTIVE_WINDOW_TTL_MS",
+        "GRAB_OVERRIDE_ACTIVE_WINDOW_DIAG",
+        "GRAB_OVERRIDE_ACTIVITY",
+        "GRAB_OVERRIDE_ACTIVITY_TTL_MS",
+        "GRAB_OVERRIDE_ACTIVITY_RATE_MS",
+        "GRAB_OVERRIDE_ACTIVITY_PROFILE",
+        "GRAB_OVERRIDE_DIAG",
+        "GRAB_OVERRIDE_DIAG_XCB",
+        "GRAB_OVERRIDE_DIAG_XINPUT",
+        NULL,
+    };
+
+    size_t env_count = 0;
+    while (environ[env_count]) env_count++;
+
+    char **child_env = calloc(env_count + 1, sizeof(*child_env));
+    if (!child_env) return -1;
+
+    size_t child_env_count = 0;
+    for (size_t i = 0; i < env_count; i++) {
+        int omit = 0;
+        for (size_t j = 0; unset_names[j]; j++) {
+            size_t name_len = strlen(unset_names[j]);
+            if (strncmp(environ[i], unset_names[j], name_len) == 0 &&
+                environ[i][name_len] == '=') {
+                omit = 1;
+                break;
+            }
+        }
+        if (!omit) child_env[child_env_count++] = environ[i];
+    }
+
+    char *const argv[] = {
+        (char *)"spectacle",
+        (char *)"--background",
+        (char *)"--nonotify",
+        (char *)"--fullscreen",
+        (char *)"--output",
+        (char *)output_path,
+        NULL,
+    };
+    posix_spawn_file_actions_t actions;
+    int spawn_error = posix_spawn_file_actions_init(&actions);
+    if (spawn_error != 0) {
+        free(child_env);
+        return -1;
+    }
+    spawn_error = posix_spawn_file_actions_addopen(
+        &actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+    pid_t pid = -1;
+    if (spawn_error == 0)
+        spawn_error = posix_spawnp(&pid, argv[0], &actions, NULL, argv, child_env);
+
+    posix_spawn_file_actions_destroy(&actions);
+    free(child_env);
+    if (spawn_error != 0) return -1;
+
+    int status;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
+
     struct stat st;
     if (stat(output_path, &st) != 0 || st.st_size == 0) return -1;
     return 0;

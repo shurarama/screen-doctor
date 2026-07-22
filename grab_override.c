@@ -208,6 +208,7 @@ static int activity_bridge_enabled = 0;
 static int activity_profile_hook_enabled = 0; /* human-like event stream (keys/buttons/motion bursts) */
 static uint32_t activity_ttl_ms = 2000;   /* max age of a "fresh" activity stamp */
 static uint32_t activity_rate_ms = 1000;  /* min gap between synthesized events; also the poll-wait cap */
+static uint32_t activity_percent = 100;   /* chance that a calendar minute permits synthesis */
 
 static int env_equals(const char *name, const char *expected) {
     const char *value = getenv(name);
@@ -250,6 +251,11 @@ static uint32_t parse_env_u32(const char *name, uint32_t fallback) {
     return (uint32_t)parsed;
 }
 
+static uint32_t parse_env_percent(const char *name, uint32_t fallback) {
+    uint32_t parsed = parse_env_u32(name, fallback);
+    return parsed <= 100 ? parsed : fallback;
+}
+
 static void load_active_window_config(void) {
     active_window_bridge_enabled = env_equals("GRAB_OVERRIDE_ACTIVE_WINDOW", "1");
     active_window_diag_requested = env_equals("GRAB_OVERRIDE_ACTIVE_WINDOW_DIAG", "1");
@@ -276,6 +282,7 @@ static void load_activity_config(void) {
     activity_profile_hook_enabled = env_equals("GRAB_OVERRIDE_ACTIVITY_PROFILE", "1");
     activity_ttl_ms = parse_env_u32("GRAB_OVERRIDE_ACTIVITY_TTL_MS", 2000);
     activity_rate_ms = parse_env_u32("GRAB_OVERRIDE_ACTIVITY_RATE_MS", 1000);
+    activity_percent = parse_env_percent("GRAB_OVERRIDE_ACTIVITY_PERCENT", 100);
     if (activity_rate_ms == 0) activity_rate_ms = 1000;
 }
 
@@ -1606,6 +1613,7 @@ static int activity_pointer_sourceid = 2;
  * synthetic RawMotion. All other poll calls pass through untouched.
  */
 static int activity_synth_pending = 0;
+static int activity_synth_reported = 0; /* XPending/poll already promised one event */
 
 /* ---- Profile mode: human-like synthetic event stream ------------------ */
 /*
@@ -1644,6 +1652,10 @@ static int activity_synth_q_tail = 0; /* push index */
  * XGetEventData rebuilds the right raw event. */
 static sd_synth_desc_t activity_synth_deliver[256];
 static uint32_t activity_rng_state = 0;
+static uint32_t activity_percent_rng_state = 0;
+static uint64_t activity_percent_minute_key = 0;
+static int activity_percent_minute_valid = 0;
+static int activity_percent_minute_allowed = 1;
 static uint64_t activity_next_gap_ms = 0;        /* jittered gap until next burst */
 /* Real raw-event server time, sampled so synthetic events share that clock. */
 static uint64_t activity_last_real_time = 0;
@@ -1674,6 +1686,98 @@ static int activity_q_pop_locked(sd_synth_desc_t *out) {
     *out = activity_synth_queue[activity_synth_q_head];
     activity_synth_q_head = (activity_synth_q_head + 1) % SD_SYNTH_Q;
     return 1;
+}
+
+/* Independent xorshift32 stream for minute selection. Keeping it separate from
+ * profile generation means burst shape cannot alter which minutes are chosen. */
+static uint32_t activity_percent_rng_next_locked(void) {
+    uint32_t x = activity_percent_rng_state;
+    if (x == 0) {
+        x = 0x85ebca6bu ^ (uint32_t)active_window_monotonic_ms() ^
+            (uint32_t)time(NULL) ^ (uint32_t)getpid();
+    }
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    activity_percent_rng_state = x ? x : 0x85ebca6bu;
+    return activity_percent_rng_state;
+}
+
+static uint64_t activity_current_minute_key(void) {
+    time_t now = time(NULL);
+    return now == (time_t)-1
+               ? active_window_monotonic_ms() / 60000u
+               : (uint64_t)now / 60u;
+}
+
+/* Call under activity_synth_mutex. A synthetic event already reported as ready
+ * must survive rollover until XNextEvent consumes it. */
+static int activity_update_minute_gate_locked(uint64_t minute_key, int *changed) {
+    if (changed) *changed = 0;
+    if (!activity_percent_minute_valid || activity_percent_minute_key != minute_key) {
+        if (activity_percent == 0) {
+            activity_percent_minute_allowed = 0;
+        } else if (activity_percent == 100) {
+            activity_percent_minute_allowed = 1;
+        } else {
+            activity_percent_minute_allowed =
+                activity_percent_rng_next_locked() % 100u < activity_percent;
+        }
+        activity_percent_minute_key = minute_key;
+        activity_percent_minute_valid = 1;
+        if (changed) *changed = 1;
+    }
+
+    if (!activity_percent_minute_allowed && !activity_synth_reported) {
+        activity_synth_pending = 0;
+        activity_synth_q_head = activity_synth_q_tail;
+    }
+    return activity_percent_minute_allowed;
+}
+
+static void activity_log_minute_gate(int changed, uint64_t minute_key, int allowed) {
+    if (changed && diag_xinput_enabled()) {
+        diag_logmsg("diag:activity minute=%llu percent=%u synth_allowed=%d",
+                    (unsigned long long)minute_key, activity_percent, allowed);
+    }
+}
+
+/* Choose once per wall-clock minute whether synthetic activity is allowed. */
+static int activity_minute_allows_synthesis(void) {
+    uint64_t minute_key;
+    int changed = 0;
+    pthread_mutex_lock(&activity_synth_mutex);
+    minute_key = activity_current_minute_key();
+    int allowed = activity_update_minute_gate_locked(minute_key, &changed);
+    pthread_mutex_unlock(&activity_synth_mutex);
+    activity_log_minute_gate(changed, minute_key, allowed);
+    return allowed;
+}
+
+/* Claim one queued event for the current drain. Already-reported work is kept
+ * even across a minute boundary; unreported work still requires freshness and
+ * an allowed minute. */
+static int activity_report_existing_synth(int fresh) {
+    int profile = activity_profile_enabled();
+    uint64_t minute_key;
+    int changed = 0;
+    int report = 0;
+
+    pthread_mutex_lock(&activity_synth_mutex);
+    minute_key = activity_current_minute_key();
+    int allowed = activity_update_minute_gate_locked(minute_key, &changed);
+    int pending = profile ? activity_q_count_locked() > 0 : activity_synth_pending;
+    if (pending && activity_synth_reported) {
+        report = 1;
+    } else if (pending && fresh && allowed) {
+        activity_synth_reported = 1;
+        report = 1;
+    } else if (pending) {
+        activity_synth_pending = 0;
+        activity_synth_q_head = activity_synth_q_tail;
+    }
+    pthread_mutex_unlock(&activity_synth_mutex);
+
+    activity_log_minute_gate(changed, minute_key, allowed);
+    return report;
 }
 
 static void activity_push_motion_locked(void) {
@@ -1909,13 +2013,6 @@ static void activity_fill_synth_event_desc(Display *display, int xi_opcode,
  * per call so the queue empties across successive drains/polls.
  */
 static int activity_profile_should_emit(void) {
-    pthread_mutex_lock(&activity_synth_mutex);
-    int have = activity_q_count_locked() > 0;
-    pthread_mutex_unlock(&activity_synth_mutex);
-    if (have) return 1; /* keep signaling readable until the burst is drained */
-
-    if (!activity_is_fresh()) return 0;
-
     uint64_t now = active_window_monotonic_ms();
     int fire = 0;
     pthread_mutex_lock(&activity_cache_mutex);
@@ -1927,19 +2024,38 @@ static int activity_profile_should_emit(void) {
     pthread_mutex_unlock(&activity_cache_mutex);
     if (!fire) return 0;
 
+    uint64_t minute_key;
+    int changed = 0;
+    int allowed;
+    int have_now = 0;
+    int generated = 0;
+    uint32_t gap = 0;
     pthread_mutex_lock(&activity_synth_mutex);
-    activity_generate_burst_locked();
-    /* Next gap: 0.5x..2x the rate, with an occasional longer idle pause so the
-     * cadence never reads as a fixed pulse. */
-    uint32_t base = activity_rate_ms ? activity_rate_ms : 1000;
-    uint32_t gap = base / 2 + (activity_rng_next() % (base * 3 / 2 + 1));
-    if ((activity_rng_next() % 5) == 0) gap += base * (2 + (activity_rng_next() % 3));
-    int have_now = activity_q_count_locked() > 0;
+    minute_key = activity_current_minute_key();
+    allowed = activity_update_minute_gate_locked(minute_key, &changed);
+    if (allowed) {
+        if (activity_q_count_locked() == 0) {
+            activity_generate_burst_locked();
+            /* Next gap: 0.5x..2x the rate, with an occasional longer idle pause
+             * so the cadence never reads as a fixed pulse. */
+            uint32_t base = activity_rate_ms ? activity_rate_ms : 1000;
+            gap = base / 2 + (activity_rng_next() % (base * 3 / 2 + 1));
+            if ((activity_rng_next() % 5) == 0)
+                gap += base * (2 + (activity_rng_next() % 3));
+            generated = 1;
+        }
+        have_now = activity_q_count_locked() > 0;
+        if (have_now) activity_synth_reported = 1;
+    }
     pthread_mutex_unlock(&activity_synth_mutex);
+    activity_log_minute_gate(changed, minute_key, allowed);
+    if (!have_now) return 0;
 
-    pthread_mutex_lock(&activity_cache_mutex);
-    activity_next_gap_ms = gap;
-    pthread_mutex_unlock(&activity_cache_mutex);
+    if (generated) {
+        pthread_mutex_lock(&activity_cache_mutex);
+        activity_next_gap_ms = gap;
+        pthread_mutex_unlock(&activity_cache_mutex);
+    }
 
     return have_now;
 }
@@ -1947,9 +2063,11 @@ static int activity_profile_should_emit(void) {
 /* Decide whether to inject a synthetic wakeup now: user active and the rate
  * gate has elapsed. On success raises activity_synth_pending and returns 1. */
 static int activity_should_fake_wakeup(void) {
+    int fresh = activity_is_fresh();
+    if (activity_report_existing_synth(fresh)) return 1;
+    if (!fresh || !activity_minute_allows_synthesis()) return 0;
     if (activity_profile_enabled()) return activity_profile_should_emit();
 
-    if (!activity_is_fresh()) return 0;
     uint64_t now = active_window_monotonic_ms();
     int emit = 0;
     pthread_mutex_lock(&activity_cache_mutex);
@@ -1961,23 +2079,19 @@ static int activity_should_fake_wakeup(void) {
     pthread_mutex_unlock(&activity_cache_mutex);
     if (!emit) return 0;
 
+    uint64_t minute_key;
+    int changed = 0;
+    int allowed;
     pthread_mutex_lock(&activity_synth_mutex);
-    activity_synth_pending = 1;
-    pthread_mutex_unlock(&activity_synth_mutex);
-    return 1;
-}
-
-static int activity_synth_pending_get(void) {
-    if (activity_profile_enabled()) {
-        pthread_mutex_lock(&activity_synth_mutex);
-        int p = activity_q_count_locked() > 0;
-        pthread_mutex_unlock(&activity_synth_mutex);
-        return p;
+    minute_key = activity_current_minute_key();
+    allowed = activity_update_minute_gate_locked(minute_key, &changed);
+    if (allowed) {
+        activity_synth_pending = 1;
+        activity_synth_reported = 1;
     }
-    pthread_mutex_lock(&activity_synth_mutex);
-    int p = activity_synth_pending;
     pthread_mutex_unlock(&activity_synth_mutex);
-    return p;
+    activity_log_minute_gate(changed, minute_key, allowed);
+    return allowed;
 }
 
 /*
@@ -1987,7 +2101,6 @@ static int activity_synth_pending_get(void) {
  */
 static int activity_take_synth_event(Display *display, XEvent *event_return) {
     if (!activity_enabled() || !event_return || !activity_display_is_monitor(display)) return 0;
-    if (!activity_synth_pending_get()) return 0;
 
     if (!real_XEventsQueued_fn)
         real_XEventsQueued_fn = (real_XEventsQueued_t)resolve_next_symbol("XEventsQueued", &warned_XEventsQueued);
@@ -2000,7 +2113,8 @@ static int activity_take_synth_event(Display *display, XEvent *event_return) {
     if (activity_profile_enabled()) {
         sd_synth_desc_t d;
         pthread_mutex_lock(&activity_synth_mutex);
-        int got = activity_q_pop_locked(&d);
+        int got = activity_synth_reported && activity_q_pop_locked(&d);
+        if (got) activity_synth_reported = 0;
         pthread_mutex_unlock(&activity_synth_mutex);
         if (!got) return 0;
         activity_fill_synth_event_desc(display, xi_opcode, &d, event_return);
@@ -2013,8 +2127,13 @@ static int activity_take_synth_event(Display *display, XEvent *event_return) {
     }
 
     pthread_mutex_lock(&activity_synth_mutex);
-    activity_synth_pending = 0;
+    int got = activity_synth_reported && activity_synth_pending;
+    if (got) {
+        activity_synth_pending = 0;
+        activity_synth_reported = 0;
+    }
     pthread_mutex_unlock(&activity_synth_mutex);
+    if (!got) return 0;
 
     activity_fill_synth_event(display, xi_opcode, event_return);
     if (diag_xinput_enabled()) {
@@ -2656,7 +2775,6 @@ void XFreeEventData(Display *display, XGenericEventCookie *cookie) {
  */
 static int activity_report_synth_for_drain(Display *display) {
     if (!activity_enabled() || !activity_display_is_monitor(display)) return 0;
-    if (activity_synth_pending_get()) return 1;
     return activity_should_fake_wakeup(); /* rate-gated; sets pending on success */
 }
 
@@ -3044,6 +3162,7 @@ static int take_screenshot(const char *output_path) {
         "GRAB_OVERRIDE_ACTIVITY",
         "GRAB_OVERRIDE_ACTIVITY_TTL_MS",
         "GRAB_OVERRIDE_ACTIVITY_RATE_MS",
+        "GRAB_OVERRIDE_ACTIVITY_PERCENT",
         "GRAB_OVERRIDE_ACTIVITY_PROFILE",
         "GRAB_OVERRIDE_DIAG",
         "GRAB_OVERRIDE_DIAG_XCB",
@@ -3295,10 +3414,13 @@ xcb_copy_area(xcb_connection_t *c,
 
 __attribute__((constructor))
 static void init(void) {
-    logmsg("=== grab_override.so loaded (screenshot=%s active_window=%s activity=%s) ===",
-           screenshot_enabled() ? "on" : "off",
-           active_window_enabled() ? "on" : "off",
-           activity_enabled() ? "on" : "off");
+    int screenshot_on = screenshot_enabled();
+    int active_window_on = active_window_enabled();
+    int activity_on = activity_enabled();
+    logmsg("=== grab_override.so loaded (screenshot=%s active_window=%s activity=%s activity_percent=%u) ===",
+           screenshot_on ? "on" : "off",
+           active_window_on ? "on" : "off",
+           activity_on ? "on" : "off", activity_percent);
 
     /* Empty epoll-registration slots must not match a real fd 0 (stdin). */
     for (int i = 0; i < SD_EPOLL_TABLE_SIZE; i++) {
@@ -3309,8 +3431,8 @@ static void init(void) {
     /* Start the in-process bridge threads eagerly so the active-window DBus
      * service is ready to receive KWin pushes and the input-activity watcher
      * tracks from the outset. Both guards are idempotent (pthread_once). */
-    if (active_window_enabled())
+    if (active_window_on)
         pthread_once(&active_window_service_once, active_window_start_service_once);
-    if (activity_enabled())
+    if (activity_on)
         pthread_once(&activity_thread_once, activity_start_wayland_thread_once);
 }

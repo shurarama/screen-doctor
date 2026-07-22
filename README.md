@@ -191,6 +191,7 @@ env \
   QT_QPA_PLATFORM=xcb \
   GRAB_OVERRIDE_ACTIVE_WINDOW=1 \
   GRAB_OVERRIDE_ACTIVITY=1 \
+  GRAB_OVERRIDE_ACTIVITY_PERCENT=100 \
   LD_PRELOAD=/home/ashperling/screen-doctor/grab_override.so \
   /home/ashperling/timedoctor/timedoctor --no-sandbox --customuri=
 ```
@@ -205,6 +206,7 @@ Important environment variables:
 - `GRAB_OVERRIDE_ACTIVE_WINDOW=1`: enable synthetic XCB active-window replies (starts the in-process D-Bus service).
 - `GRAB_OVERRIDE_ACTIVE_WINDOW_TTL_MS=5000`: active-window freshness threshold, default `5000`.
 - `GRAB_OVERRIDE_ACTIVITY=1`: enable the input-activity bridge (starts the in-process Wayland idle watcher and RawMotion synthesis).
+- `GRAB_OVERRIDE_ACTIVITY_PERCENT=100`: expected percentage of calendar minutes in which synthetic activity is allowed, default `100`.
 
 Each hook is disabled by default unless its corresponding `GRAB_OVERRIDE_*` variable is set.
 
@@ -325,6 +327,7 @@ Tuning (optional):
 
 - `GRAB_OVERRIDE_ACTIVITY_TTL_MS` (default 2000): max age of a "fresh" activity stamp before synthesis stops.
 - `GRAB_OVERRIDE_ACTIVITY_RATE_MS` (default 1000): minimum gap between synthesized events; also the cap on the monitor connection's poll wait.
+- `GRAB_OVERRIDE_ACTIVITY_PERCENT` (integer `0..100`, default `100`): independently allows each wall-clock minute with the configured probability. For example, `80` means that each calendar minute is selected with an 80% probability; the observed ratio converges to 80% over time rather than enforcing an exact hourly quota. A selected minute still produces no synthetic events unless `activity_is_fresh()` confirms recent real Wayland input. `0` disables synthetic activity and `100` preserves the previous behavior; invalid or out-of-range values fall back to `100`. Real X11/XInput events are never suppressed, so Time Doctor's final percentage can exceed this target.
 - `GRAB_OVERRIDE_ACTIVITY_PROFILE=1` (default off): shape the synthetic stream to resemble human input instead of a single bare RawMotion per interval. Emits weighted bursts — motion runs with real valuator (dx/dy) deltas, keystroke press/release pairs, and clicks/scrolls — restricted to the raw event classes the monitor actually subscribed to, with jittered gaps between bursts. Still gated on real compositor input (`activity_is_fresh()`); it never fabricates activity from nothing, and remains privacy-preserving (a plausible profile, not a replay of real keys/coordinates).
 
 Expected bridge diagnostics (with `GRAB_OVERRIDE_DIAG=1`):
@@ -333,6 +336,7 @@ Expected bridge diagnostics (with `GRAB_OVERRIDE_DIAG=1`):
 diag:activity wayland watching via get_input_idle_notification
 diag:activity monitor display=0x... fd=NN noted (raw-motion subscription)
 diag:activity state fresh=1 (in-process wayland watcher)
+diag:activity minute=29740035 percent=80 synth_allowed=1
 diag:activity synth evtype=RawMotion device=2 cookie=0x5d000003
 diag:xinput XNextEvent type=GenericEvent(35) extension=131 evtype=RawMotion(17) synthetic=1
 ```
